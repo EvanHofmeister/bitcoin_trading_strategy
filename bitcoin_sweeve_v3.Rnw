@@ -1,0 +1,318 @@
+\documentclass[10pt]{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{mathtools}
+\usepackage{textcomp}
+\usepackage{float}
+\usepackage{multicol}
+\usepackage{bm}
+\def\p#1{\left( #1 \right)}
+\newcommand{\Lagr}{\mathscr{L}}
+\begin{document}
+
+\title{\vspace{-1in}\Large Replicating Comparative Automated Bitcoin Trading Strategies \\\vspace{10pt} \large Writing sample from CFRM 521: Machine Learning for Finance \vspace{-35pt}}
+\author{}
+\date{}
+\pagestyle{myheadings}
+\maketitle
+
+\vspace{-20pt}
+\noindent \hrulefill
+\thispagestyle{empty}
+
+\begin{multicols}{2}
+	
+\section{Introduction}
+
+\subsection{Our Approach and Previous Work}
+
+The purpose of this paper is to replicate and validate the findings reported in a paper on machine learning algorithms for Bitcoin trading written by Hegazy and Mumford. We began by generating a dataset that is as close as possible to the original described in the paper and then we used the same methods used by the authors, including Weighted Linear Regression, Gaussian Discriminant Analysis, Logistic Regression, and Recurrent Reinforcement Learning and compared our results to those of the original paper.
+
+\subsection{Data Processing}
+
+To generate the same dataset that was used by Hegazy and Mumford, we downloaded price data from the same source, Bitcoincharts.com, and placed trades into 8-minute binds. If more than one trade existed inside of a bin, the price for the bin was found by weighting each trade by the number of shares sold at that price.  The original study used two nearly consecutive 250-day windows, however, an exact start date of the dataset was not listed. In response, we made a visual approximation of the start date. There should be 45,000 observations in a 250-day window. However, in our dataset there were 12,500 observations, which suggests that there were many 8-minute windows without a trade. Although the Hegazy and Mumford paper does not discuss how the authors handled these cases, our replication attempts for Figure-\ref{fig:two} strongly suggest that bins without trades were dropped. 
+
+Once we had a complete set of data, we attempted to smooth the data by implementing locally weighted linear regression. As a part of this procedure, the times of each of the 30 previous time bins were put in the form $(1,t_i)$ and concatenated to form a $2 \times 30$ matrix. Unfortunately, we were unable to replicate this smoothing procedure because the reference paper did not define an appropriate value for $t_i$.\footnote{The paper also defined an index j relative to the current index, so we know this is not a correct interpretation for $t_i$.} Instead, we implemented a standard exponentially weighted moving average by using the stats package in R. The smoothing parameter was chosen to visually match the graph of the prices over time with the graph from the paper.\footnote{Essentially, we decreased parameter until volotility spikes appeared to be the same magnitude.} Figure~\ref{fig:one} is a replication of the price chart from the original paper.
+
+<<startup, echo = FALSE, results = 'hide', message = FALSE, warning = FALSE>>=
+library(anytime)
+library(tidyverse)
+library(dplyr)
+library(magrittr)
+library(readr)
+library(MASS)
+library(xtable)
+library(zoo)
+@
+
+<<locf, echo = FALSE, results = 'hide', cache = TRUE>>=
+
+rm(list=ls())
+
+# Parameters for loading data
+names = c("time","price","shares")
+types <- list(time = col_integer(), price = col_double(), shares = col_double())
+
+# Set smoothing ratio
+ratio <- 0.4
+
+dat <- 
+  read_csv("bcEUR.csv",col_names = names, col_types= types, skip = 2) %>%
+  set_names(c("time","price","shares")) %>%
+  mutate(utc = anytime(.$time,asUTC = TRUE) %>%
+           cut(breaks = "30 min", ordered_result = TRUE)) %>%
+  group_by(utc) %>%
+  summarise(price = sum(price*shares)/sum(shares)) %>%
+  ungroup %>%
+  mutate(time = as.numeric(as.POSIXct(utc, tz = "UTC")),
+         price = na.locf(price)) %>%
+  mutate(smooth = stats::filter(price*ratio,1-ratio,
+                                "recursive",init = price[1]))
+
+derivs <- dat %>%
+  dplyr::select(time, smooth) %>%
+  mutate(difftime  = c(NA,diff(time,diff=1)/3600)) %>%
+  mutate(one   = c(NA,diff(smooth,diff=1)),
+         two   = c(NA,NA,diff(smooth,diff=2)),
+         three = c(NA,NA,NA,diff(smooth,diff=3)),
+         four  = c(NA,NA,NA,NA,diff(smooth,diff=4)),
+         five  = c(NA,NA,NA,NA,NA,diff(smooth,diff=5))) %>%
+  mutate(one = one / difftime, two = two / difftime^2, three = three / difftime^3,
+         four = four / difftime^4, five = five / difftime^5)
+@
+
+\begin{figure}[H]
+\centering
+\vspace*{-25pt}
+<<plot1, echo = FALSE, results = 'hide'>>=
+train <- derivs %>% filter(time > 1.391e9) %>% 
+  filter(time < 1.41115e9) %>% dplyr::select(smooth,time)
+train <- zoo(train$smooth,order.by = (train$time-1.391e9)/86400)
+test  <- derivs %>% filter(time > 1.4112e9) %>% 
+  filter(time < 1.43135e9) %>% dplyr::select(smooth,time)
+test <- zoo(test$smooth,order.by = (test$time -1.4112e9)/86400)
+
+plot(train, type = 'l', col = 4, xlim = c(0,250), ylim = c(100,700), 
+     xlab = "Time (Days)", ylab = "Price (EUR)")
+lines(test, col = 2)
+legend("topright",col = c(4,2),lwd = 2, c("Train","Test"))
+@
+\vspace*{-15pt}
+\caption{The binned and smoothed price data}
+\label{fig:one}
+\end{figure}
+
+\subsection{Trading Approach and Metrics}
+
+We implemented the correct rate portion of this section. The trading metric was poorly specified in the original paper and we were unable to get it to work. With additional time, we could look more into implementing the CWC and profit but at the moment it is not clear exactly how to interpret $q_i$ for this purpose.
+
+The feature set $x^{(i)}$ used for all the algoritms is the first five derivatives of the price data. We show how we calculate the first derivative below.
+<<derivs>>=
+derivs_ex <- dat %>%
+dplyr::select(time, smooth) %>%
+mutate(dt=c(NA,diff(time,diff=1))) %>%
+mutate(one=c(NA,diff(smooth,diff=1))) %>%
+mutate(one=one/dt)
+@
+
+\section{Algorithms Examined}
+
+\subsection{Weighted Linear Regression}
+
+The weighted linear regression was the simplest algorithm to implement. We applied the formula directly to the derivatives.
+
+<<weighted>>=
+weighted <- derivs %>%
+filter(time > 1.391e9) %>% 
+filter(time < 1.43135e9) %>%
+mutate(q = 2/(1+exp(-one/mean(abs(one))))-1)
+@
+
+\begin{figure}[H]
+\centering
+\vspace*{-25pt}
+<<plot2, echo = FALSE, results = 'hide'>>=
+increase <- derivs %>% filter(time > 1.391e9) %>% 
+  filter(time < 1.43135e9) %>% mutate(lag = c(one[-1],NA)) %>%
+  filter(lag > 0)
+decrease  <- derivs %>% filter(time > 1.391e9) %>% 
+  filter(time < 1.43135e9) %>% mutate(lag = c(one[-1],NA)) %>%
+  filter(lag < 0)
+
+plot(x = increase$one, y = increase$two, col = 4,
+     xlim = c(-50,25), ylim = c(-90,90),
+     xlab = "First Derivative", ylab = "Second Derivative")
+points(x = decrease$one, y = decrease$two, col = 2)
+legend("topright",col = c(4,2),lwd = 2, c("Increase","Decrease"))
+@
+\vspace*{-15pt}
+\caption{Spread of first and second derivatives for use in GDA}
+\label{fig:two}
+\end{figure}
+
+\noindent The end result is superior to what the paper found for their correct rate:
+<<weighted_cr, echo = FALSE, results = 'asis'>>=
+predict <- weighted$one * lag(weighted$q) > 0
+cr_weighted <- sum(predict[-1]) / (dim(weighted)[1]-1)
+@
+\begin{table}[H]
+\centering
+\begin{tabular}{lr}
+  \hline
+ & Train \& Test \\ 
+  \hline
+New & \Sexpr{cr_weighted} \\ 
+  Old & 0.4883 \\ 
+   \hline
+\end{tabular}
+\end{table}
+
+\subsection{Gaussian Determinant Analysis}
+
+To perform GDA we replicated the approach from the paper almost exactly\footnote{There was a typo in equation 8 where the exponential was missing a negative sign.} instead of using a built-in R package. When we replicated Figure~\ref{fig:two} we noted that there was not a vertical line of points where the derivative was equal to zero, which suggests that the empty bins were not filled using last observation carried forward. Because the derivative graph depends on the smoothing parameter and derivative units, we did not expect the graphs to be identical. Surprisingly, the shape of the two graphs were quite different even when we adjusted the smoothing parameter. We do not think we made a mistake in calculating the derivatives so we suspect that the differing smoothing functions are the cause.
+
+The GDA code is too long to display in the paper; our implementation can be viewed in the accompanying code file. We again failed to replicate the original results:
+<<gda, echo = FALSE>>=
+train <- derivs %>% filter(time > 1.391e9) %>% 
+  filter(time < 1.41115e9) %>% dplyr::select(one:five)
+test  <- derivs %>% filter(time > 1.4112e9) %>% 
+  filter(time < 1.43135e9) %>% dplyr::select(one:five)
+
+# Define functions useful for GDA analysis
+square <- function(...){
+  x <- matrix(c(...), ncol = 1)
+  return(x %*% t(x))
+}
+
+minus <- function(..., y){
+  return(c(...)-y)
+}
+
+mult <- function(vec,mat){
+  return(-t(vec) %*% mat %*% vec)
+}
+
+# Compute GDA
+mu_p <- train %>% mutate(lag = c(one[-1],NA)) %>%
+  filter(lag > 0) %>% dplyr::select(one:five) %>% colMeans
+mu_m <- train %>% mutate(lag = c(one[-1],NA)) %>%
+  filter(lag < 0) %>% dplyr::select(one:five) %>% colMeans
+sigma_1 <- train %>% pmap(.,square) %>% Reduce(f = "+")
+sigma_2 <- mu_p %>% square %>% colSums
+sigma_3 <- mu_m %>% square %>% colSums
+sigma <- (sigma_1 - sigma_2 - sigma_3)/dim(train)[1]
+sig_inv <- solve(sigma, tol = 1e-10)
+
+g_p_train <- train %>% 
+  pmap(.,minus, y = mu_p) %>% 
+  map(as.matrix, ncol = 1) %>% 
+  map(mult,sig_inv) %>% 
+  unlist %>% exp
+
+g_m_train <- train %>% 
+  pmap(.,minus, y = mu_m) %>% 
+  map(as.matrix, ncol = 1) %>% 
+  map(mult,sig_inv) %>% 
+  unlist %>% exp
+
+g_p_test <- test %>% 
+  pmap(.,minus, y = mu_p) %>% 
+  map(as.matrix, ncol = 1) %>% 
+  map(mult,sig_inv) %>% 
+  unlist %>% exp
+
+g_m_test <- test %>% 
+  pmap(.,minus, y = mu_m) %>% 
+  map(as.matrix, ncol = 1) %>% 
+  map(mult,sig_inv) %>%
+  unlist %>% exp
+
+gda_train <- 2* g_p_train / (g_p_train + g_m_train) - 1
+gda_test <- 2* g_p_test / (g_p_test + g_m_test) - 1
+
+# Correct Rate
+predict1 <- train$one * lag(gda_train,n=1) > 0
+gda_train_cr <- sum(predict1[-1]) / length(predict1)
+predict2 <- test$one * lag(gda_test,n=1) > 0
+gda_test_cr <- sum(predict2[-1]) / length(predict2)
+@
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrr}
+  \hline
+ & Train & Test \\ 
+  \hline
+New & \Sexpr{gda_train_cr} & \Sexpr{gda_test_cr} \\ 
+  Old & 0.5128 & 0.5234 \\ 
+   \hline
+\end{tabular}
+\end{table}
+
+\subsection{Logistic Regression}
+
+In the original paper the authors use a stochastic gradient descent to find the estimates for the logistic regression. We used the built-in glm() function in R to attempt to achieve the same result.
+
+<<logit, echo = FALSE>>=
+train <- derivs %>% filter(time > 1.391e9) %>% filter(time < 1.41115e9) %>% 
+  mutate(lag = c(one[-1],NA)) %>% mutate(y = ifelse(lag > 0,1,0)) %>% na.omit
+test  <- derivs %>% filter(time > 1.4112e9) %>% filter(time < 1.43135e9) %>% 
+  mutate(lag = c(one[-1],NA)) %>% mutate(y = ifelse(lag > 0,1,0)) %>% na.omit
+@
+<<logit2>>=
+fit1 <- glm(y~one+two+three+four+five,
+  family=binomial(link="logit"),data=train)
+@
+<<logit3, echo = FALSE>>=
+q_train <- 2*predict(fit1,type= "response")-1
+logit1 <- (train$one * lag(q_train,n=1)) > 0
+logit_train_cr <- sum(logit1[-1]) / length(logit1)
+
+q_test <- 2*predict(fit1,test,type= "response")-1
+logit2 <- test$one * lag(q_test,n=1) > 0
+logit_test_cr <- sum(logit2[-1]) / length(logit2)
+@
+\noindent The end result did not match the original paper for correct rate:
+\begin{table}[H]
+\centering
+\begin{tabular}{lrr}
+  \hline
+ & Train & Test \\ 
+  \hline
+New & \Sexpr{logit_train_cr} & \Sexpr{logit_test_cr} \\ 
+  Old & 0.5372 & 0.5504 \\ 
+   \hline
+\end{tabular}
+\end{table}
+
+\subsection{Recurrent Reinforcement Learning (RRL)}
+
+We attempted to implement Recurrent Reinforcement Learning (RRL) using the methods outlined in the paper. As mentioned by the authors, bitcoin could not be shorted at the time, so the implementation varied slightly from a traditional approach to RRL trading algorithms. The basic idea of RRL is to maximize the Sharpe ratio for a given Bitcoin price.
+
+Typically in RRL, gradient ascent is required to be derive the from the data. Normally, you could find $dF_t/d\theta$ from the collective time series data. The authors of this paper instead chose to use online learning to approximate $dF_t/d\theta$. This approach uses the previous partial derivative value $dF_{t-1}/dw$.
+
+We attempted to implement the "Trader Function" ($F_t$), and all gradient equations as closely to the paper as possible. This was more difficult than anticipated as the paper had several errors in the gradient equations (Eq. 22). After implementation, testing and modifying the process several times, we were able to find a correct rate which closely matched that found by the authors. We found the correct rate to be 0.521 for the training period and 0.564 for the testing period.
+
+We again attempted to implement the CWC and profit ratio estimate functions but found them to grossly miss-estimate the values compared to the paper. We chose to omit this portion from the results and code appendix.
+
+The main discrepancy between our results and those from the paper, agian could have resulted from the variation in how derivatives were calculated. This is because RRL is very sensitive to small changes in the derivatives. Like in other models, the authors did not mention how many of the five features (derivatives) they implemented. We chose to use two since the CR estimates most closely matched the results presented in the paper.
+
+We also found that if the time-series data is not smoothed enough then the derivatives will be too noisy to effectively perform RRL. Our implementation of RRL was affected by the sparse information presented in the paper on how pre-processing was performed.
+
+\section{Analysis: Comparing Algorithm Performance}
+
+Clearly we were unable to replicate the results from any algorithm reported in the Hegazy and Mumford paper. Our first observation in our analysis is that Figure ~\ref{fig:two} is strikingly different from that in the original paper. Since the derivatives are the inputs to all of the algorithms it is not surprising that the results are very different. It is unclear why the derivatives are so different but we suspect at least part of the difference is the smoothing function. One interesting issue to note about the derivatives plot in the original paper is that there appears to be a distinct diagonal line through the data, which is absent in our plot. This could be a feature of the smoothing function used by Hegazy and Mumford, or it could suggest a mistake.
+
+Another issue to note about their paper is that it consistently has the test dataset outperform the training dataset. In our analysis we are unable to replicate this feature in any algorithm, despite trying a wide range of smoothing parameters.
+
+We concluded that our attempt to replicate the findings of the Hegazy and Mumford paper could have been greatly improved if their paper had more clearly described the exact procedures used in the analysis. Attempting to replicate the orginal results entailed substantial guesswork and so it is unsurprising that we could not replicate the reported findings. If we had more time we might have reached out to the authors to better understand their approach.
+
+\end{multicols}
+\end{document}
+
+
+
+
